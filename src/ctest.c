@@ -6,7 +6,7 @@
 #define MY_NUM (5)
 
 int main() {
-// logical operator precidence over conditional
+// logical operator precedence over conditional
 #if defined(UNDEFINED) || MY_NUM > 2
     assert(true);
 #else
@@ -20,7 +20,7 @@ int main() {
     assert(false);
 #endif
 
-// comparison operators have precidence over arithmetic
+// comparison operators have precedence over arithmetic
 #if MY_NUM < 2 * 3
     assert(true);
 #else
