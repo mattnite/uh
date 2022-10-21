@@ -8,7 +8,7 @@ pub const Tokenizer = @import("Tokenizer.zig");
 const LangOpts = @import("LangOpts.zig");
 const Preprocessor = @import("Preprocessor.zig");
 const Parser = @import("Parser.zig");
-const Source = @import("Source.zig");
+pub const Source = @import("Source.zig");
 const util = @import("util.zig");
 
 var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};

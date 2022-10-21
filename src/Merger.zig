@@ -1,18 +1,32 @@
 const std = @import("std");
 const arocc = @import("arocc");
+const StringCollection = @import("StringCollection.zig");
+const Expr = @import("Expr.zig");
 const Tokenizer = arocc.Tokenizer;
 const assert = std.debug.assert;
 
-// one way we might want to consider the preprocessor we might want to
-// preprocess the files _except_ for includes. This could be added as a special
-// entry to the parser
+const Merger = @This();
 
-// at the end of the day we have a list of inputs that turn into <arch>-<os>-<abi>
+// defines which are set when this target is chosen
+pub const Define = struct {
+    key: []const u8,
+    value: ?[]const u8 = null,
+};
+
+pub const Input = struct {
+    base_dir: []const u8,
+    name: []const u8,
+    defines: []const Define,
+};
+
+const InputMap = std.StringHashMap(struct {
+    base_dir: []const u8,
+    headers: std.StringArrayHashMapUnmanaged(void),
+});
+
+const DefineId = StringCollection.Id;
 const TokenIndex = u32;
-
-// I don't see there being more than 65k conditionals in a single file
-const ConditionalIndex = u16;
-
+const PreprocessorBlockIndex = u16;
 const BranchId = enum(u8) {
     main = 0xff,
     _,
@@ -26,9 +40,9 @@ const BranchId = enum(u8) {
     }
 };
 
-const ConditionalDependency = struct {
-    from: ConditionalIndex,
-    to: ConditionalIndex,
+const PreprocessorBlockDependency = struct {
+    from: PreprocessorBlockIndex,
+    to: PreprocessorBlockIndex,
 };
 
 /// NOTE: inclusive range, TODO: maybe rename to first and last?
@@ -37,114 +51,167 @@ const TokenRange = struct {
     end: TokenIndex,
 };
 
-const Conditional = struct {
+const PreprocessorBlock = struct {
     start: TokenRange,
     finish: TokenRange,
 };
 
-const Expression = struct {
-    cond_idx: ConditionalIndex,
+const Conditional = struct {
+    block_idx: PreprocessorBlockIndex,
     branch_id: BranchId,
 };
 
-const InProgressConditional = struct {
+const InProgressPreprocessorBlock = struct {
     start: TokenRange,
-    dependents: std.ArrayListUnmanaged(ConditionalIndex) = .{},
+    dependents: std.ArrayListUnmanaged(PreprocessorBlockIndex) = .{},
     elifs: std.ArrayListUnmanaged(TokenRange) = .{},
     @"else": ?TokenRange = null,
 
-    fn deinit(self: *InProgressConditional, allocator: std.mem.Allocator) void {
+    fn deinit(self: *InProgressPreprocessorBlock, allocator: std.mem.Allocator) void {
         self.dependents.deinit(allocator);
         self.elifs.deinit(allocator);
     }
 };
 
 const ElifPair = struct {
-    cond_idx: ConditionalIndex,
+    block_idx: PreprocessorBlockIndex,
     elif: TokenRange,
 };
 
-// calling this Id since I might change it from an index later
-const StringId = u32;
-const StringCollection = struct {
-    list: std.ArrayList([]const u8),
-    map: std.StringHashMap(StringId),
-
-    fn init(allocator: std.mem.Allocator) StringCollection {
-        return StringCollection{
-            .list = std.ArrayList([]const u8).init(allocator),
-            .map = std.StringHashMap(StringId).init(allocator),
-        };
-    }
-
-    fn deinit(self: *StringCollection) void {
-        self.list.deinit();
-        self.map.deinit();
-    }
-
-    // get id for existing string, or create entry. Since we're using allocated
-    // files to back all the strings, we don't need to copy
-    fn getId(self: *StringCollection, str: []const u8) !StringId {
-        return self.map.get(str) orelse blk: {
-            const id = @intCast(StringId, self.list.items.len);
-            try self.list.append(str);
-            break :blk id;
-        };
-    }
-
-    // you shouldn't have a string id that doesn't exist in the collection
-    fn getString(self: StringCollection, id: StringId) []const u8 {
-        return self.list.items[id];
-    }
-};
-
-/// just a string for now
-const DefineId = StringId;
-
-fn consumeTokensUntil(
-    current: u32,
+const HeaderMap = std.StringHashMap(struct {
     tokens: []Tokenizer.Token,
-    needle: Tokenizer.Token.Id,
-) !u32 {
-    var idx = current;
-    while (idx < tokens.len - 1) {
-        idx += 1;
-        if (tokens[idx].id == needle or tokens[idx].id == .eof)
-            return idx - 1;
-    }
+});
 
-    std.log.err("was looking for {}, searched:", .{needle});
-    for (tokens[current..]) |token|
-        std.log.err("  {}", .{token});
+allocator: std.mem.Allocator,
+arena: std.heap.ArenaAllocator,
+progress: std.Progress,
+inputs: InputMap,
+string_collection: StringCollection,
+headers: HeaderMap,
 
-    return error.NotFound;
+pub fn init(allocator: std.mem.Allocator) !Merger {
+    return Merger{
+        .allocator = allocator,
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .progress = std.Progress{},
+        .inputs = InputMap.init(allocator),
+        .string_collection = StringCollection.init(allocator),
+        .headers = HeaderMap.init(allocator),
+    };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .stack_trace_frames = 10,
-    }){};
-    defer _ = gpa.deinit();
+pub fn deinit(self: *Merger) void {
+    self.arena.deinit();
 
-    const allocator = gpa.allocator();
-    var comp = arocc.Compilation.init(allocator);
+    var it = self.inputs.iterator();
+    while (it.next()) |entry|
+        entry.value_ptr.headers.deinit(self.allocator);
+
+    self.inputs.deinit();
+    self.string_collection.deinit();
+}
+
+pub fn addInput(self: *Merger, input: Input) !void {
+    var headers = std.StringArrayHashMapUnmanaged(void){};
+    errdefer headers.deinit(self.allocator);
+
+    var dir = try std.fs.cwd().openIterableDir(input.base_dir, .{});
+    defer dir.close();
+
+    var walker = try dir.walk(self.allocator);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry|
+        if (entry.kind == .File) {
+            try headers.put(self.allocator, try self.arena.allocator().dupe(u8, entry.path), {});
+        };
+
+    try self.inputs.putNoClobber(input.name, .{
+        .base_dir = input.base_dir,
+        .headers = headers,
+    });
+}
+
+pub fn index(self: *Merger) !void {
+    var count: usize = 0;
+    var input_it = self.inputs.iterator();
+    while (input_it.next()) |entry|
+        count += entry.value_ptr.headers.count();
+
+    const node = self.progress.start("indexing headers", count);
+    node.activate();
+
+    input_it = self.inputs.iterator();
+    while (input_it.next()) |input_entry| {
+        var header_it = input_entry.value_ptr.headers.iterator();
+        while (header_it.next()) |header_entry| {
+            const full_path = try std.fs.path.join(self.allocator, &.{
+                input_entry.value_ptr.*.base_dir,
+                header_entry.key_ptr.*,
+            });
+            defer self.allocator.free(full_path);
+
+            try self.indexFile(input_entry.key_ptr.*, header_entry.key_ptr.*);
+            node.completeOne();
+        }
+    }
+
+    node.end();
+}
+
+pub fn merge(self: *Merger) !void {
+    var unique_headers = std.StringArrayHashMap(void).init(self.allocator);
+    defer unique_headers.deinit();
+
+    var input_it = self.inputs.iterator();
+    while (input_it.next()) |input_entry| {
+        var header_it = input_entry.value_ptr.headers.iterator();
+        while (header_it.next()) |header_entry|
+            try unique_headers.put(header_entry.key_ptr.*, {});
+    }
+
+    const node = self.progress.start("merging headers", unique_headers.count());
+    node.activate();
+
+    var it = unique_headers.iterator();
+    while (it.next()) |header_entry| {
+        input_it = self.inputs.iterator();
+        while (input_it.next()) |input_entry| {
+            const full_path = try std.fs.path.join(self.allocator, &.{
+                input_entry.value_ptr.*.base_dir,
+                header_entry.key_ptr.*,
+            });
+            defer self.allocator.free(full_path);
+
+            std.time.sleep(100 * std.time.ns_per_ms);
+        }
+
+        node.completeOne();
+    }
+}
+
+fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
+    const base_dir = self.inputs.get(input_name).?.base_dir;
+    const header_path = try std.fs.path.join(self.allocator, &.{
+        base_dir,
+        path,
+    });
+    defer self.allocator.free(header_path);
+
+    var comp = arocc.Compilation.init(self.allocator);
     defer comp.deinit();
 
     try comp.addDefaultPragmaHandlers();
-    comp.langopts.setEmulatedCompiler(comp.systemCompiler());
-    comp.target = std.Target{
-        .cpu = std.Target.Cpu.baseline(.x86_64),
-        .os = std.Target.Os.Tag.linux.defaultVersionRange(.x86_64),
-        .abi = .musl,
-        .ofmt = .elf,
-    };
+    //comp.langopts.setEmulatedCompiler(comp.systemCompiler());
+    //comp.target = std.Target{
+    //    .cpu = std.Target.Cpu.baseline(.x86_64),
+    //    .os = std.Target.Os.Tag.linux.defaultVersionRange(.x86_64),
+    //    .abi = .musl,
+    //    .ofmt = .elf,
+    //};
 
-    var arg_it = std.process.ArgIteratorPosix.init();
-    _ = arg_it.skip();
-    const path = arg_it.next().?;
-
-    const source = try comp.addSourceFromPath(path);
-    try comp.include_dirs.append("x86_64-linux-musl");
+    const source = try comp.addSourceFromPath(header_path);
+    try comp.include_dirs.append(base_dir);
 
     var tokenizer = arocc.Tokenizer{
         .buf = source.buf,
@@ -152,46 +219,33 @@ pub fn main() !void {
         .source = source.id,
     };
 
-    var conditionals = std.ArrayList(Conditional).init(gpa.allocator());
+    var conditionals = std.ArrayList(PreprocessorBlock).init(self.allocator);
     defer conditionals.deinit();
 
     // contains the start line of a conditional
-    var in_progress_conditionals = std.ArrayList(InProgressConditional).init(gpa.allocator());
+    var in_progress_conditionals = std.ArrayList(InProgressPreprocessorBlock).init(self.allocator);
     defer {
         for (in_progress_conditionals.items) |*ipc|
-            ipc.deinit(gpa.allocator());
+            ipc.deinit(self.allocator);
         in_progress_conditionals.deinit();
     }
 
-    var tokens = std.ArrayList(Tokenizer.Token).init(gpa.allocator());
+    var tokens = std.ArrayList(Tokenizer.Token).init(self.allocator);
     defer tokens.deinit();
 
     // the "leaf" is the key
-    var dependencies = std.AutoArrayHashMap(ConditionalIndex, ConditionalIndex).init(gpa.allocator());
+    var dependencies = std.AutoArrayHashMap(PreprocessorBlockIndex, PreprocessorBlockIndex).init(self.allocator);
     defer dependencies.deinit();
 
-    // TODO: make index for mapping cond_idx to a range of Elifs. This is fine for now though
-    var elifs = std.ArrayList(ElifPair).init(gpa.allocator());
+    // TODO: make index for mapping block_idx to a range of Elifs. This is fine for now though
+    var elifs = std.ArrayList(ElifPair).init(self.allocator);
     defer elifs.deinit();
 
-    var elses = std.AutoHashMap(ConditionalIndex, TokenRange).init(gpa.allocator());
+    var elses = std.AutoHashMap(PreprocessorBlockIndex, TokenRange).init(self.allocator);
     defer elses.deinit();
 
-    var defines = StringCollection.init(gpa.allocator());
+    var defines = StringCollection.init(self.allocator);
     defer defines.deinit();
-
-    // TODO: make this into a set
-    var define_interest = std.AutoHashMap(ConditionalIndex, std.AutoArrayHashMapUnmanaged(DefineId, void)).init(gpa.allocator());
-    defer {
-        var it = define_interest.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit(gpa.allocator());
-        }
-
-        define_interest.deinit();
-    }
-
-    // TODO: drop comments and extraneous whitespace
 
     while (true) {
         const tok = tokenizer.next();
@@ -239,7 +293,7 @@ pub fn main() !void {
                     .keyword_elif => {
                         i = try consumeTokensUntil(i, tokens.items, .nl);
                         const current = &in_progress_conditionals.items[in_progress_conditionals.items.len - 1];
-                        try current.elifs.append(gpa.allocator(), .{
+                        try current.elifs.append(self.allocator, .{
                             .begin = tok_idx,
                             .end = i,
                         });
@@ -259,9 +313,9 @@ pub fn main() !void {
                     .keyword_endif => {
                         i = try consumeTokensUntil(i, tokens.items, .nl);
                         var in_progress = in_progress_conditionals.pop();
-                        defer in_progress.deinit(gpa.allocator());
+                        defer in_progress.deinit(self.allocator);
 
-                        const cond_idx = @intCast(ConditionalIndex, conditionals.items.len);
+                        const block_idx = @intCast(PreprocessorBlockIndex, conditionals.items.len);
                         try conditionals.append(.{
                             .start = in_progress.start,
                             .finish = .{
@@ -273,22 +327,22 @@ pub fn main() !void {
                         // we've processed all the dependents by now, so we can
                         // throw them onto the table
                         for (in_progress.dependents.items) |dependent|
-                            try dependencies.put(dependent, cond_idx);
+                            try dependencies.put(dependent, block_idx);
 
                         for (in_progress.elifs.items) |elif|
                             try elifs.append(.{
-                                .cond_idx = cond_idx,
+                                .block_idx = block_idx,
                                 .elif = elif,
                             });
 
                         if (in_progress.@"else") |@"else"|
-                            try elses.putNoClobber(cond_idx, @"else");
+                            try elses.putNoClobber(block_idx, @"else");
 
                         // finally, now that our conditional has been
                         // instantiated, it can be added as a dependent to the
                         // top of the in_progress stack
                         if (in_progress_conditionals.items.len > 0)
-                            try in_progress_conditionals.items[in_progress_conditionals.items.len - 1].dependents.append(gpa.allocator(), cond_idx);
+                            try in_progress_conditionals.items[in_progress_conditionals.items.len - 1].dependents.append(self.allocator, block_idx);
                     },
                     .keyword_define,
                     .keyword_include,
@@ -313,7 +367,7 @@ pub fn main() !void {
         }
     }
 
-    const stdout = std.io.getStdOut().writer();
+    //const stdout = std.io.getStdOut().writer();
     if (conditionals.items.len > 0) {
         // TODO: if there's an include guard, it'll be the last conditional, check
         // if it covers almost all of the file (at least the useful bits). If it's
@@ -325,24 +379,24 @@ pub fn main() !void {
         // checked for
 
         // definitely an include guard: begins at first token, ends at last token
-        const cond_idx = @intCast(ConditionalIndex, conditionals.items.len - 1);
-        const maybe_include_guard = &conditionals.items[cond_idx];
+        const block_idx = @intCast(PreprocessorBlockIndex, conditionals.items.len - 1);
+        const maybe_include_guard = &conditionals.items[block_idx];
         if (tokensAreOneOf(tokens.items[0..maybe_include_guard.start.begin], &.{.nl}) and
             tokensAreOneOf(tokens.items[maybe_include_guard.finish.end + 1 ..], &.{ .nl, .eof }) and
             tokens.items[maybe_include_guard.start.begin + 1].id == .keyword_ifndef and
             // include guards shouldn't have an else
-            !elses.contains(cond_idx))
+            !elses.contains(block_idx))
         {
             _ = conditionals.pop();
 
             var it = dependencies.iterator();
             while (it.next()) |entry| {
-                if (entry.value_ptr.* == cond_idx)
+                if (entry.value_ptr.* == block_idx)
                     _ = dependencies.swapRemove(entry.key_ptr.*);
             }
 
             assert(for (elifs.items) |pair| {
-                if (pair.cond_idx == cond_idx)
+                if (pair.block_idx == block_idx)
                     break false;
             } else true);
         }
@@ -360,87 +414,65 @@ pub fn main() !void {
     // be the main expression, and then the rest will be for indexing the
     // elifs. Initially we'll back the enum with a u8 since I don't think we'll
     // run into a conditional with that many branches
-    //
-    // The other thing we're interested is a list of defines that are important
-    // for the expression. As we continue to explore the problem space, we'll
-    // collect different contraints for each define, such as the type, or if a
-    // certain value causes an #error
 
-    // traverse every conditional and its branches, find what defines they're interested in
+    // only do parsing here, no analysis
     for (conditionals.items) |cond, idx| {
-        const cond_idx = @intCast(ConditionalIndex, idx);
+        const block_idx = @intCast(PreprocessorBlockIndex, idx);
+        var expr = try Expr.fromTokens(
+            self.allocator,
+            tokens.items[cond.start.begin..cond.start.end],
+            tokenizer.buf,
+            &self.string_collection,
+        );
+        defer expr.deinit(self.allocator);
 
-        // main expression
-        try findDefinesInExpression(tokenizer, &defines, &define_interest, cond_idx, tokens.items[cond.start.begin .. cond.start.end + 1]);
         for (elifs.items) |pair| {
-            if (pair.cond_idx == cond_idx) {
-                try findDefinesInExpression(tokenizer, &defines, &define_interest, cond_idx, tokens.items[pair.elif.begin .. pair.elif.end + 1]);
+            if (pair.block_idx == block_idx) {
+                var elif_expr = try Expr.fromTokens(
+                    self.allocator,
+                    tokens.items[pair.elif.begin..pair.elif.end],
+                    tokenizer.buf,
+                    &self.string_collection,
+                );
+                defer elif_expr.deinit(self.allocator);
             }
         }
     }
+}
 
-    // only do printing here, no analysis
-    try stdout.print("count: {}\n", .{tokens.items.len});
-    try stdout.writeAll("conditionals:\n");
-    for (conditionals.items) |cond, idx| {
-        const cond_idx = @intCast(ConditionalIndex, idx);
-        const start_token = tokens.items[cond.start.begin];
-        const end_token = tokens.items[cond.start.end];
-        try stdout.print("  {}\n", .{cond});
-
-        try stdout.print("    expr: {s}\n", .{tokenizer.buf[start_token.start..end_token.end]});
-        for (elifs.items) |pair| {
-            if (pair.cond_idx == cond_idx) {
-                try stdout.print("          {s}\n", .{tokenizer.buf[tokens.items[pair.elif.begin].start..tokens.items[pair.elif.end].end]});
-            }
-        }
-        if (elses.get(cond_idx) != null)
-            try stdout.print("          #else\n", .{});
-
-        if (define_interest.get(cond_idx)) |interested_defines| {
-            try stdout.writeAll("    interested in defines:\n");
-            var it = interested_defines.iterator();
-            while (it.next()) |entry|
-                try stdout.print("    - {s}\n", .{defines.getString(entry.key_ptr.*)});
-        }
-    }
-
-    //for (tokens.items) |token|
-    //    try stdout.print("  {}\n", .{token});
-
-    //for (tokens.items) |token| {
-    //    try stdout.writeAll(tokenizer.buf[token.start..token.end]);
-    //}
+pub fn saveTo(self: *Merger, out_path: []const u8) !void {
+    _ = out_path;
+    _ = self;
 }
 
 fn addTokenDefine(
     tokenizer: Tokenizer,
     defines: *StringCollection,
-    define_interest: *std.AutoHashMap(ConditionalIndex, std.AutoArrayHashMapUnmanaged(DefineId, void)),
-    cond_idx: ConditionalIndex,
+    define_interest: *std.AutoHashMap(PreprocessorBlockIndex, std.AutoArrayHashMapUnmanaged(DefineId, void)),
+    block_idx: PreprocessorBlockIndex,
     tokens: []Tokenizer.Token,
     i: u32,
 ) !void {
     const define_str = tokenizer.buf[tokens[i].start..tokens[i].end];
     const define_id = try defines.getId(define_str);
     const allocator = define_interest.allocator;
-    if (define_interest.getEntry(cond_idx)) |entry| {
+    if (define_interest.getEntry(block_idx)) |entry| {
         try entry.value_ptr.put(allocator, define_id, {});
     } else {
         var define_ids = std.AutoArrayHashMapUnmanaged(DefineId, void){};
         errdefer define_ids.deinit(allocator);
 
         try define_ids.put(allocator, define_id, {});
-        try define_interest.put(cond_idx, define_ids);
+        try define_interest.put(block_idx, define_ids);
     }
 }
 
 // TODO: find if defines are defined in the current file or in an included file
-fn findDefinesInExpression(
+fn findDefinesInConditional(
     tokenizer: Tokenizer,
     defines: *StringCollection,
-    define_interest: *std.AutoHashMap(ConditionalIndex, std.AutoArrayHashMapUnmanaged(DefineId, void)),
-    cond_idx: ConditionalIndex,
+    define_interest: *std.AutoHashMap(PreprocessorBlockIndex, std.AutoArrayHashMapUnmanaged(DefineId, void)),
+    block_idx: PreprocessorBlockIndex,
     tokens: []Tokenizer.Token,
 ) !void {
     // first token should always be a hash
@@ -481,10 +513,10 @@ fn findDefinesInExpression(
                 while (i < tokens.len and tokens[i].id == .whitespace) : (i += 1) {}
 
                 assert(tokens[i].id == .identifier);
-                try addTokenDefine(tokenizer, defines, define_interest, cond_idx, tokens, i);
+                try addTokenDefine(tokenizer, defines, define_interest, block_idx, tokens, i);
             },
             // first sighting of this was in a comparison
-            .identifier => try addTokenDefine(tokenizer, defines, define_interest, cond_idx, tokens, i),
+            .identifier => try addTokenDefine(tokenizer, defines, define_interest, block_idx, tokens, i),
             // some uses of this don't have brackets
             .keyword_defined => {
                 i += 1;
@@ -495,7 +527,7 @@ fn findDefinesInExpression(
                 while (i < tokens.len and tokens[i].id == .whitespace) : (i += 1) {}
 
                 assert(tokens[i].id == .identifier);
-                try addTokenDefine(tokenizer, defines, define_interest, cond_idx, tokens, i);
+                try addTokenDefine(tokenizer, defines, define_interest, block_idx, tokens, i);
 
                 if (tokens[i].id == .r_paren)
                     i += 1;
@@ -519,4 +551,23 @@ fn tokensAreOneOf(tokens: []Tokenizer.Token, ids: []const Tokenizer.Token.Id) bo
         if (!found)
             break false;
     } else true;
+}
+
+fn consumeTokensUntil(
+    current: u32,
+    tokens: []Tokenizer.Token,
+    needle: Tokenizer.Token.Id,
+) !u32 {
+    var idx = current;
+    while (idx < tokens.len - 1) {
+        idx += 1;
+        if (tokens[idx].id == needle or tokens[idx].id == .eof)
+            return idx;
+    }
+
+    std.log.err("was looking for {}, searched:", .{needle});
+    for (tokens[current..]) |token|
+        std.log.err("  {}", .{token});
+
+    return error.NotFound;
 }

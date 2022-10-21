@@ -22,19 +22,13 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("uh", "src/main.zig");
-    exe.setTarget(target);
-    exe.setBuildMode(mode);
-    exe.addPackage(arocc);
-    exe.install();
+    const merge = b.addExecutable("merge", "src/merge.zig");
+    merge.setTarget(target);
+    merge.setBuildMode(mode);
+    merge.addPackage(arocc);
+    merge.install();
 
-    const squish = b.addExecutable("squish", "src/squish.zig");
-    squish.setTarget(target);
-    squish.setBuildMode(mode);
-    squish.addPackage(arocc);
-    squish.install();
-
-    const run_cmd = squish.run();
+    const run_cmd = merge.run();
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
@@ -43,10 +37,21 @@ pub fn build(b: *std.build.Builder) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const exe_tests = b.addTest("src/main.zig");
-    exe_tests.setTarget(target);
-    exe_tests.setBuildMode(mode);
+    const merge_tests = b.addTest("src/merge.zig");
+    merge_tests.setTarget(target);
+    merge_tests.setBuildMode(mode);
+    merge_tests.addPackage(arocc);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&exe_tests.step);
+    test_step.dependOn(&merge_tests.step);
+
+    const ctest = b.addExecutable("ctest", null);
+    ctest.setTarget(target);
+    ctest.setBuildMode(mode);
+    ctest.addCSourceFile("src/ctest.c", &.{"-std=c89"});
+    ctest.linkLibC();
+
+    const ctest_run = ctest.run();
+    const ctest_step = b.step("ctest", "Run c tests (somewhere for me to test assumptions)");
+    ctest_step.dependOn(&ctest_run.step);
 }
