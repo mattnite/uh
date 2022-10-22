@@ -3,6 +3,26 @@ const Merger = @import("Merger.zig");
 
 const inputs: []const Merger.Input = &.{
     .{
+        .base_dir = "headers/aarch64-linux-gnu.2.33",
+        .name = "aarch64-linux-gnu.2.33",
+        .defines = &.{
+            .{ .key = "__linux__" },
+            .{ .key = "__aarch64__" },
+            .{ .key = "__GNUC__", .value = "2" },
+            .{ .key = "__GNUC_MINOR__", .value = "33" },
+        },
+    },
+    .{
+        .base_dir = "headers/aarch64-linux-gnu.2.34",
+        .name = "aarch64-linux-gnu.2.34",
+        .defines = &.{
+            .{ .key = "__linux__" },
+            .{ .key = "__aarch64__" },
+            .{ .key = "__GNUC__", .value = "2" },
+            .{ .key = "__GNUC_MINOR__", .value = "34" },
+        },
+    },
+    .{
         .base_dir = "headers/x86_64-macos.10-none",
         .name = "x86_64-macos.10-none",
         .defines = &.{
@@ -135,6 +155,7 @@ pub fn main() !void {
         try merger.addInput(input);
 
     try merger.index();
+    try std.io.getStdErr().writer().print("index is roughly {} bytes\n", .{merger.getByteSize()});
     try merger.merge();
 
     try merger.saveTo("out");

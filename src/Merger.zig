@@ -19,9 +19,24 @@ pub const Input = struct {
     defines: []const Define,
 };
 
+const Header = struct {
+    includes: std.AutoArrayHashMapUnmanaged(StringCollection.Id, void) = .{},
+    conditionals: std.ArrayListUnmanaged(PreprocessorBlock) = .{},
+    exprs: std.ArrayListUnmanaged(Expr) = .{},
+
+    fn deinit(self: *Header, allocator: std.mem.Allocator) void {
+        for (self.exprs.items) |*expr|
+            expr.deinit(allocator);
+
+        self.exprs.deinit(allocator);
+        self.includes.deinit(allocator);
+        self.conditionals.deinit(allocator);
+    }
+};
+
 const InputMap = std.StringHashMap(struct {
     base_dir: []const u8,
-    headers: std.StringArrayHashMapUnmanaged(void),
+    headers: std.StringArrayHashMapUnmanaged(Header),
 });
 
 const DefineId = StringCollection.Id;
@@ -104,15 +119,19 @@ pub fn deinit(self: *Merger) void {
     self.arena.deinit();
 
     var it = self.inputs.iterator();
-    while (it.next()) |entry|
+    while (it.next()) |entry| {
+        var header_it = entry.value_ptr.headers.iterator();
+        while (header_it.next()) |header_entry|
+            header_entry.value_ptr.deinit(self.allocator);
         entry.value_ptr.headers.deinit(self.allocator);
+    }
 
     self.inputs.deinit();
     self.string_collection.deinit();
 }
 
 pub fn addInput(self: *Merger, input: Input) !void {
-    var headers = std.StringArrayHashMapUnmanaged(void){};
+    var headers = std.StringArrayHashMapUnmanaged(Header){};
     errdefer headers.deinit(self.allocator);
 
     var dir = try std.fs.cwd().openIterableDir(input.base_dir, .{});
@@ -123,7 +142,7 @@ pub fn addInput(self: *Merger, input: Input) !void {
 
     while (try walker.next()) |entry|
         if (entry.kind == .File) {
-            try headers.put(self.allocator, try self.arena.allocator().dupe(u8, entry.path), {});
+            try headers.put(self.allocator, try self.arena.allocator().dupe(u8, entry.path), .{});
         };
 
     try self.inputs.putNoClobber(input.name, .{
@@ -141,22 +160,38 @@ pub fn index(self: *Merger) !void {
     const node = self.progress.start("indexing headers", count);
     node.activate();
 
+    // TODO: thread pool
     input_it = self.inputs.iterator();
     while (input_it.next()) |input_entry| {
         var header_it = input_entry.value_ptr.headers.iterator();
         while (header_it.next()) |header_entry| {
-            const full_path = try std.fs.path.join(self.allocator, &.{
-                input_entry.value_ptr.*.base_dir,
-                header_entry.key_ptr.*,
-            });
-            defer self.allocator.free(full_path);
-
-            try self.indexFile(input_entry.key_ptr.*, header_entry.key_ptr.*);
+            try self.indexHeader(input_entry.key_ptr.*, header_entry.key_ptr.*, header_entry.value_ptr);
             node.completeOne();
         }
     }
 
     node.end();
+}
+
+/// get size in bytes of indexed headers, not perfect since it misses indexing structures, but good enough
+pub fn getByteSize(self: Merger) usize {
+    var ret: usize = 0;
+
+    var input_it = self.inputs.iterator();
+    while (input_it.next()) |input_entry| {
+        var header_it = input_entry.value_ptr.headers.iterator();
+        while (header_it.next()) |header_entry| {
+            ret += header_entry.value_ptr.includes.count() * @sizeOf(StringCollection.Id);
+            ret += header_entry.value_ptr.conditionals.items.len * @sizeOf(PreprocessorBlock);
+            for (header_entry.value_ptr.exprs.items) |expr|
+                ret += expr.getByteSize();
+        }
+    }
+
+    for (self.string_collection.list.items) |string|
+        ret += string.len;
+
+    return ret;
 }
 
 pub fn merge(self: *Merger) !void {
@@ -177,11 +212,8 @@ pub fn merge(self: *Merger) !void {
     while (it.next()) |header_entry| {
         input_it = self.inputs.iterator();
         while (input_it.next()) |input_entry| {
-            const full_path = try std.fs.path.join(self.allocator, &.{
-                input_entry.value_ptr.*.base_dir,
-                header_entry.key_ptr.*,
-            });
-            defer self.allocator.free(full_path);
+            _ = header_entry;
+            _ = input_entry;
 
             std.time.sleep(100 * std.time.ns_per_ms);
         }
@@ -190,7 +222,7 @@ pub fn merge(self: *Merger) !void {
     }
 }
 
-fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
+fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: *Header) !void {
     const base_dir = self.inputs.get(input_name).?.base_dir;
     const header_path = try std.fs.path.join(self.allocator, &.{
         base_dir,
@@ -201,15 +233,6 @@ fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
     var comp = arocc.Compilation.init(self.allocator);
     defer comp.deinit();
 
-    try comp.addDefaultPragmaHandlers();
-    //comp.langopts.setEmulatedCompiler(comp.systemCompiler());
-    //comp.target = std.Target{
-    //    .cpu = std.Target.Cpu.baseline(.x86_64),
-    //    .os = std.Target.Os.Tag.linux.defaultVersionRange(.x86_64),
-    //    .abi = .musl,
-    //    .ofmt = .elf,
-    //};
-
     const source = try comp.addSourceFromPath(header_path);
     try comp.include_dirs.append(base_dir);
 
@@ -218,9 +241,6 @@ fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
         .comp = &comp,
         .source = source.id,
     };
-
-    var conditionals = std.ArrayList(PreprocessorBlock).init(self.allocator);
-    defer conditionals.deinit();
 
     // contains the start line of a conditional
     var in_progress_conditionals = std.ArrayList(InProgressPreprocessorBlock).init(self.allocator);
@@ -315,8 +335,8 @@ fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
                         var in_progress = in_progress_conditionals.pop();
                         defer in_progress.deinit(self.allocator);
 
-                        const block_idx = @intCast(PreprocessorBlockIndex, conditionals.items.len);
-                        try conditionals.append(.{
+                        const block_idx = @intCast(PreprocessorBlockIndex, header.conditionals.items.len);
+                        try header.conditionals.append(self.allocator, .{
                             .start = in_progress.start,
                             .finish = .{
                                 .begin = tok_idx,
@@ -344,12 +364,23 @@ fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
                         if (in_progress_conditionals.items.len > 0)
                             try in_progress_conditionals.items[in_progress_conditionals.items.len - 1].dependents.append(self.allocator, block_idx);
                     },
+                    .keyword_include => {
+                        i += 1;
+                        // skip whitespace
+                        while (i < tokens.items.len and tokens.items[i].id == .whitespace) : (i += 1) {}
+
+                        const first_idx = i;
+                        i = try consumeTokensUntil(i, tokens.items, .nl);
+                        const include_str = tokenizer.buf[tokens.items[first_idx].start..tokens.items[i].end];
+                        try header.includes.put(self.allocator, try self.string_collection.getId(include_str), {});
+                        std.log.info("found header in {s}/{s}: {s}", .{ input_name, path, include_str });
+                    },
                     .keyword_define,
-                    .keyword_include,
                     .keyword_undef,
                     .keyword_warning,
                     .keyword_error,
                     .keyword_pragma,
+                    .keyword_include_next,
                     // so far this is used in tokenizing a define so skip it
                     .identifier,
                     => {},
@@ -368,7 +399,7 @@ fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
     }
 
     //const stdout = std.io.getStdOut().writer();
-    if (conditionals.items.len > 0) {
+    if (header.conditionals.items.len > 0) {
         // TODO: if there's an include guard, it'll be the last conditional, check
         // if it covers almost all of the file (at least the useful bits). If it's
         // not there, assert that there's a #pragma once. Otherwise the file might
@@ -379,15 +410,15 @@ fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
         // checked for
 
         // definitely an include guard: begins at first token, ends at last token
-        const block_idx = @intCast(PreprocessorBlockIndex, conditionals.items.len - 1);
-        const maybe_include_guard = &conditionals.items[block_idx];
+        const block_idx = @intCast(PreprocessorBlockIndex, header.conditionals.items.len - 1);
+        const maybe_include_guard = &header.conditionals.items[block_idx];
         if (tokensAreOneOf(tokens.items[0..maybe_include_guard.start.begin], &.{.nl}) and
             tokensAreOneOf(tokens.items[maybe_include_guard.finish.end + 1 ..], &.{ .nl, .eof }) and
             tokens.items[maybe_include_guard.start.begin + 1].id == .keyword_ifndef and
             // include guards shouldn't have an else
             !elses.contains(block_idx))
         {
-            _ = conditionals.pop();
+            _ = header.conditionals.pop();
 
             var it = dependencies.iterator();
             while (it.next()) |entry| {
@@ -416,7 +447,7 @@ fn indexFile(self: *Merger, input_name: []const u8, path: []const u8) !void {
     // run into a conditional with that many branches
 
     // only do parsing here, no analysis
-    for (conditionals.items) |cond, idx| {
+    for (header.conditionals.items) |cond, idx| {
         const block_idx = @intCast(PreprocessorBlockIndex, idx);
         var expr = try Expr.fromTokens(
             self.allocator,

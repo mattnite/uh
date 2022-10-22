@@ -16,12 +16,12 @@ pub const Operator = enum(u7) {
     identifier,
     num_literal,
     char_literal,
-    has_include,
-    has_attribute,
+    macro_invocation,
 
     // logical operators
     @"and",
     @"or",
+    ternary,
 
     // comparison operators
     equal,
@@ -70,8 +70,7 @@ pub const Operator = enum(u7) {
             .identifier,
             .num_literal,
             .char_literal,
-            .has_include,
-            .has_attribute,
+            .macro_invocation,
             => true,
             else => false,
         };
@@ -79,7 +78,7 @@ pub const Operator = enum(u7) {
 
     pub fn isLogical(op: Operator) bool {
         return switch (op) {
-            .@"and", .@"or" => true,
+            .@"and", .@"or", .ternary => true,
             else => false,
         };
     }
@@ -142,7 +141,12 @@ const OpWithNot = packed struct {
 op_with_not: std.ArrayListUnmanaged(OpWithNot) = .{},
 
 // string id
-values: std.ArrayListUnmanaged(u32) = .{},
+values: std.ArrayListUnmanaged(StringCollection.Id) = .{},
+
+pub fn getByteSize(expr: Expr) usize {
+    return (expr.op_with_not.items.len * @sizeOf(OpWithNot)) +
+        (expr.values.items.len * @sizeOf(StringCollection.Id));
+}
 
 pub fn deinit(self: *Expr, allocator: Allocator) void {
     self.op_with_not.deinit(allocator);
@@ -233,6 +237,13 @@ fn recursiveParseExpr(
     if (tokens.len == 0)
         return error.Malformed;
 
+    std.log.debug("recursively parsing: '{s}'", .{buf[tokens[0].start..tokens[tokens.len - 1].end]});
+    std.log.debug("tokens:", .{});
+    for (tokens) |token, i| {
+        std.log.debug("  {}: {}", .{ i, token });
+    }
+    std.log.debug("", .{});
+
     // move for ward to next operator
     var invert = not;
     var paren_depth: usize = 0;
@@ -247,6 +258,26 @@ fn recursiveParseExpr(
         switch (tokens[@intCast(usize, cursor)].id) {
             .r_paren => paren_depth += 1,
             .l_paren => paren_depth -= 1,
+            .question_mark => {
+                std.log.debug("found question mark", .{});
+                // this is for a ternary expression, so we have a lhs, rhs, and condition
+                if (paren_depth == 0) {
+                    try expr.op_with_not.append(allocator, .{
+                        .not = invert,
+                        .op = .ternary,
+                    });
+
+                    // TODO: nested parens and ternary expressions
+                    const question_idx = @intCast(usize, cursor);
+                    var i = question_idx;
+                    while (i < tokens.len and tokens[i].id != .colon) : (i += 1) {}
+                    const colon_idx = i;
+                    try recursiveParseExpr(allocator, tokens[colon_idx + 1 ..], buf, string_collection, expr, false);
+                    try recursiveParseExpr(allocator, tokens[question_idx + 1 .. colon_idx], buf, string_collection, expr, false);
+                    try recursiveParseExpr(allocator, tokens[0..question_idx], buf, string_collection, expr, false);
+                    return;
+                }
+            },
             .ampersand_ampersand,
             .pipe_pipe,
             .equal_equal,
@@ -308,8 +339,10 @@ fn recursiveParseExpr(
         // TODO
 
         // go until you hit defined or a parenthesis
+        std.log.debug("it:", .{});
         var i: usize = 0;
         while (i < tokens.len) : (i += 1) {
+            std.log.debug("  {}", .{tokens[i].id});
             switch (tokens[i].id) {
                 .bang => invert = !invert,
                 .keyword_defined => {
@@ -322,7 +355,13 @@ fn recursiveParseExpr(
                     while (i < tokens.len) : (i += 1) {
                         switch (tokens[i].id) {
                             .l_paren => open_bracket = true,
-                            .identifier => {
+                            // identifiers and a bunch of special define checks it seems
+                            .identifier,
+                            .keyword_restrict,
+                            .keyword_restrict1,
+                            .keyword_noreturn,
+                            .keyword_static_assert,
+                            => {
                                 try expr.op_with_not.append(allocator, .{
                                     .not = invert,
                                     .op = .defined,
@@ -369,34 +408,40 @@ fn recursiveParseExpr(
                     } else return error.Malformed;
                 },
                 .identifier, .pp_num, .char_literal, .char_literal_wide => {
-                    const str = buf[tokens[i].start..tokens[i].end];
-                    if (tokens[i].id == .identifier and std.mem.eql(u8, "__has_include", str)) {
-                        i += 1;
-                        assert(tokens[i].id == .l_paren);
-                        const l_paren_idx = i;
-                        while (i < tokens.len and tokens[i].id != .r_paren) : (i += 1) {}
-                        assert(tokens[i].id == .r_paren);
+                    const is_macro = blk: {
+                        if (tokens[i].id != .identifier and i + 1 < tokens.len)
+                            break :blk false;
 
-                        const contents = buf[tokens[l_paren_idx + 1].start..tokens[i - 1].end];
+                        var j = i + 1;
+                        skipWhitespace(tokens, &j);
+
+                        // TODO: handle more edge cases
+                        break :blk j < tokens.len and tokens[j].id == .l_paren;
+                    };
+
+                    if (is_macro) {
+                        // a macro invocation is an identifier followed by a left paren, arguments, then a right paren
+
+                        const start_idx = i;
+                        i += 1;
+                        skipWhitespace(tokens, &i);
+                        const l_paren_idx = i;
+
+                        // TODO: handle nested parenthesis
+                        while (i < tokens.len and tokens[i].id != .r_paren) : (i += 1) {
+                            if (i > l_paren_idx)
+                                assert(tokens[i].id != .l_paren);
+                        }
+
+                        assert(tokens[i].id == .r_paren);
+                        const contents = buf[tokens[start_idx].start..tokens[i].end];
                         try expr.values.append(allocator, try string_collection.getId(contents));
                         try expr.op_with_not.append(allocator, .{
                             .not = invert,
-                            .op = .has_include,
-                        });
-                    } else if (tokens[i].id == .identifier and std.mem.eql(u8, "__has_attribute", str)) {
-                        i += 1;
-                        assert(tokens[i].id == .l_paren);
-                        const l_paren_idx = i;
-                        while (i < tokens.len and tokens[i].id != .r_paren) : (i += 1) {}
-                        assert(tokens[i].id == .r_paren);
-
-                        const contents = buf[tokens[l_paren_idx + 1].start..tokens[i - 1].end];
-                        try expr.values.append(allocator, try string_collection.getId(contents));
-                        try expr.op_with_not.append(allocator, .{
-                            .not = invert,
-                            .op = .has_attribute,
+                            .op = .macro_invocation,
                         });
                     } else {
+                        const str = buf[tokens[i].start..tokens[i].end];
                         try expr.values.append(allocator, try string_collection.getId(str));
                         try expr.op_with_not.append(allocator, .{
                             .not = false,
@@ -454,7 +499,7 @@ pub fn fromExprs(
 
 pub fn write(
     expr: Expr,
-    string_collection: StringCollection,
+    string_collection: *StringCollection,
     writer: anytype,
 ) !void {
     try writer.writeAll("#if ");
@@ -489,7 +534,7 @@ fn recursiveWrite(
     expr: Expr,
     op_idx: u32,
     parens: bool,
-    string_collection: StringCollection,
+    string_collection: *StringCollection,
     writer: anytype,
 ) !void {
     const not = expr.op_with_not.items[op_idx].not;
@@ -632,7 +677,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 fn expectValues(
     expected: []const []const u8,
     actual: []const u32,
-    string_collection: StringCollection,
+    string_collection: *StringCollection,
 ) !void {
     try expectEqual(expected.len, actual.len);
 
@@ -656,7 +701,7 @@ test "ifdef" {
         .{ .not = false, .op = .defined },
     }, expr.op_with_not.items);
 
-    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, ctx.string_collection);
+    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, &ctx.string_collection);
 }
 
 test "ifndef" {
@@ -675,7 +720,7 @@ test "ifndef" {
         .{ .not = true, .op = .defined },
     }, expr.op_with_not.items);
 
-    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, ctx.string_collection);
+    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, &ctx.string_collection);
 }
 
 // this test should equate to #if SOME_DEFINE != 0. TODO: are there any other behaviors?
@@ -695,7 +740,7 @@ test "if nonzero" {
         .{ .not = false, .op = .identifier },
     }, expr.op_with_not.items);
 
-    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, ctx.string_collection);
+    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, &ctx.string_collection);
 }
 
 test "if defined" {
@@ -714,7 +759,7 @@ test "if defined" {
         .{ .not = false, .op = .defined },
     }, expr.op_with_not.items);
 
-    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, ctx.string_collection);
+    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, &ctx.string_collection);
 }
 
 test "if defined no parenthesis" {
@@ -733,7 +778,7 @@ test "if defined no parenthesis" {
         .{ .not = false, .op = .defined },
     }, expr.op_with_not.items);
 
-    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, ctx.string_collection);
+    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, &ctx.string_collection);
 }
 
 test "if not defined" {
@@ -752,7 +797,7 @@ test "if not defined" {
         .{ .not = true, .op = .defined },
     }, expr.op_with_not.items);
 
-    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, ctx.string_collection);
+    try expectValues(&.{"SOME_DEFINE"}, expr.values.items, &ctx.string_collection);
 }
 
 test "if equal" {
@@ -776,7 +821,7 @@ test "if equal" {
     try expectValues(&.{
         "1",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if not equal" {
@@ -800,7 +845,7 @@ test "if not equal" {
     try expectValues(&.{
         "1",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if less than" {
@@ -824,7 +869,7 @@ test "if less than" {
     try expectValues(&.{
         "1",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if greater than" {
@@ -848,7 +893,7 @@ test "if greater than" {
     try expectValues(&.{
         "1",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if less than equal to" {
@@ -872,7 +917,7 @@ test "if less than equal to" {
     try expectValues(&.{
         "1",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if greater than equal to" {
@@ -896,7 +941,7 @@ test "if greater than equal to" {
     try expectValues(&.{
         "1",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if ((A))" {
@@ -917,7 +962,7 @@ test "if ((A))" {
 
     try expectValues(&.{
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if !!A" {
@@ -938,7 +983,7 @@ test "if !!A" {
 
     try expectValues(&.{
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if !(!A)" {
@@ -959,7 +1004,7 @@ test "if !(!A)" {
 
     try expectValues(&.{
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if (!(!A))" {
@@ -980,7 +1025,7 @@ test "if (!(!A))" {
 
     try expectValues(&.{
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if A and B" {
@@ -1004,7 +1049,7 @@ test "if A and B" {
     try expectValues(&.{
         "SOMETHING_ELSE",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if (A and B)" {
@@ -1028,7 +1073,7 @@ test "if (A and B)" {
     try expectValues(&.{
         "SOMETHING_ELSE",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if A or B" {
@@ -1052,7 +1097,7 @@ test "if A or B" {
     try expectValues(&.{
         "SOMETHING_ELSE",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if (A or B)" {
@@ -1076,7 +1121,7 @@ test "if (A or B)" {
     try expectValues(&.{
         "SOMETHING_ELSE",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if !(A or B)" {
@@ -1100,7 +1145,7 @@ test "if !(A or B)" {
     try expectValues(&.{
         "SOMETHING_ELSE",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if !(A or !B)" {
@@ -1124,7 +1169,7 @@ test "if !(A or !B)" {
     try expectValues(&.{
         "SOMETHING_ELSE",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if A or (!B and !(C or D)) and !E" {
@@ -1163,7 +1208,7 @@ test "if A or (!B and !(C or D)) and !E" {
         "5",
         "FOO",
         "FOO",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if A || B > 2" {
@@ -1190,7 +1235,7 @@ test "if A || B > 2" {
         "2",
         "MY_NUM",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if (A || B) > 2" {
@@ -1217,7 +1262,7 @@ test "if (A || B) > 2" {
         "2",
         "MY_NUM",
         "SOME_DEFINE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if A < 2 * 3" {
@@ -1244,7 +1289,7 @@ test "if A < 2 * 3" {
         "3",
         "2",
         "MY_NUM",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if (A < 2) * 3 == 0" {
@@ -1274,7 +1319,7 @@ test "if (A < 2) * 3 == 0" {
         "3",
         "2",
         "MY_NUM",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if (A && B) * 3 == 3" {
@@ -1304,7 +1349,7 @@ test "if (A && B) * 3 == 3" {
         "3",
         "FOO",
         "MY_NUM",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "if defined(_XOPEN_SOURCE) && _XOPEN_SOURCE+0 < 700" {
@@ -1334,7 +1379,36 @@ test "if defined(_XOPEN_SOURCE) && _XOPEN_SOURCE+0 < 700" {
         "0",
         "_XOPEN_SOURCE",
         "_XOPEN_SOURCE",
-    }, expr.values.items, ctx.string_collection);
+    }, expr.values.items, &ctx.string_collection);
+}
+
+test "if defined __cplusplus ? __cplusplus >= 201402L : defined __USE_ISOC11" {
+    var ctx = try getTokenTestContext(
+        \\#if defined __cplusplus ? __cplusplus >= 201402L : defined __USE_ISOC11
+        \\#endif
+        \\
+    );
+    defer ctx.deinit();
+
+    const tokens = ctx.getFirstIfExpression();
+    var expr = try Expr.fromTokens(std.testing.allocator, tokens, ctx.buf, &ctx.string_collection);
+    defer expr.deinit(std.testing.allocator);
+
+    try expectEqualSlices(OpWithNot, &.{
+        .{ .not = false, .op = .ternary },
+        .{ .not = false, .op = .defined },
+        .{ .not = false, .op = .greater_than_equal_to },
+        .{ .not = false, .op = .num_literal },
+        .{ .not = false, .op = .identifier },
+        .{ .not = false, .op = .defined },
+    }, expr.op_with_not.items);
+
+    try expectValues(&.{
+        "__USE_ISOC11",
+        "201402L",
+        "__cplusplus",
+        "__cplusplus",
+    }, expr.values.items, &ctx.string_collection);
 }
 
 test "write.ifdef" {
@@ -1352,7 +1426,7 @@ test "write.ifdef" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if defined(SOME_DEFINE)",
         out.items,
@@ -1374,7 +1448,7 @@ test "write.ifndef" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if !defined(SOME_DEFINE)",
         out.items,
@@ -1396,7 +1470,7 @@ test "write.if equal" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if SOME_DEFINE == 1",
         out.items,
@@ -1418,7 +1492,7 @@ test "write.if not equal" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if SOME_DEFINE != 1",
         out.items,
@@ -1440,7 +1514,7 @@ test "write.if less than" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if SOME_DEFINE < 1",
         out.items,
@@ -1462,7 +1536,7 @@ test "write.if greater than" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if SOME_DEFINE > 1",
         out.items,
@@ -1484,7 +1558,7 @@ test "write.if greater than equal to" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if SOME_DEFINE >= 1",
         out.items,
@@ -1506,7 +1580,7 @@ test "write.if ((A))" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if defined(SOME_DEFINE)",
         out.items,
@@ -1528,7 +1602,7 @@ test "write.if !!A" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if defined(SOME_DEFINE)",
         out.items,
@@ -1550,7 +1624,7 @@ test "write.if (!(!A))" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if defined(SOME_DEFINE)",
         out.items,
@@ -1572,7 +1646,7 @@ test "write.if A and B" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if defined(SOME_DEFINE) && defined(SOMETHING_ELSE)",
         out.items,
@@ -1594,7 +1668,7 @@ test "write.if !(A or B)" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if !(defined(SOME_DEFINE) || defined(SOMETHING_ELSE))",
         out.items,
@@ -1616,7 +1690,7 @@ test "write.if A or (!B and !(C or D)) and !E" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if defined(FOO) || (FOO != 5 && !(defined(BAR) || SUPERJOE < 6)) && !defined(WHATDIDYOUSAY)",
         out.items,
@@ -1638,7 +1712,7 @@ test "write.if defined(_XOPEN_SOURCE) && _XOPEN_SOURCE+0 < 700" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if defined(_XOPEN_SOURCE) && _XOPEN_SOURCE + 0 < 700",
         out.items,
@@ -1660,7 +1734,7 @@ test "write.if A || B > 2" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if defined(SOME_DEFINE) || MY_NUM > 2",
         out.items,
@@ -1682,7 +1756,7 @@ test "write.if (A || B) > 2" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if (defined(SOME_DEFINE) || MY_NUM) > 2",
         out.items,
@@ -1704,7 +1778,7 @@ test "write.if A < 2 * 3" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if MY_NUM < 2 * 3",
         out.items,
@@ -1726,7 +1800,7 @@ test "write.if (A < 2) * 3 == 0" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if (MY_NUM < 2) * 3 == 0",
         out.items,
@@ -1748,7 +1822,7 @@ test "write.if (A && B) * 3 == 3" {
     var out = std.ArrayList(u8).init(std.testing.allocator);
     defer out.deinit();
 
-    try expr.write(ctx.string_collection, out.writer());
+    try expr.write(&ctx.string_collection, out.writer());
     try expectEqualStrings(
         "#if (MY_NUM && defined(FOO)) * 3 == 3",
         out.items,
