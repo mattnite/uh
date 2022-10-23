@@ -1,0 +1,8 @@
+{
+    "defines": [
+        { "key": "__linux__" },
+        { "key": "__aarch64__" },
+        { "key": "__GNUC__", "value": "2" },
+        { "key": "__GNUC_MINOR__", "value": "33" }
+    ]
+}

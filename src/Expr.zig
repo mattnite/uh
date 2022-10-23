@@ -145,7 +145,8 @@ values: std.ArrayListUnmanaged(StringCollection.Id) = .{},
 
 pub fn getByteSize(expr: Expr) usize {
     return (expr.op_with_not.items.len * @sizeOf(OpWithNot)) +
-        (expr.values.items.len * @sizeOf(StringCollection.Id));
+        (expr.values.items.len * @sizeOf(StringCollection.Id)) +
+        @sizeOf(Expr);
 }
 
 pub fn deinit(self: *Expr, allocator: Allocator) void {
@@ -155,7 +156,7 @@ pub fn deinit(self: *Expr, allocator: Allocator) void {
 
 pub fn fromTokens(
     allocator: Allocator,
-    tokens: []Token,
+    tokens: []const Token,
     buf: []const u8,
     string_collection: *StringCollection,
 ) !Expr {
@@ -213,7 +214,7 @@ pub fn fromTokens(
     return ret;
 }
 
-fn skipWhitespace(haystack: []Token, i: *usize) void {
+fn skipWhitespace(haystack: []const Token, i: *usize) void {
     while (i.* < haystack.len) : (i.* += 1) {
         if (haystack[i.*].id != .whitespace) {
             break;
@@ -228,7 +229,7 @@ const OpResult = struct {
 
 fn recursiveParseExpr(
     allocator: Allocator,
-    tokens: []Token,
+    tokens: []const Token,
     buf: []const u8,
     string_collection: *StringCollection,
     expr: *Expr,
@@ -464,7 +465,7 @@ fn recursiveParseExpr(
     }
 }
 
-pub fn copy(allocator: Allocator, expr: Expr) !Expr {
+pub fn copy(expr: Expr, allocator: Allocator) !Expr {
     var ret = Expr{};
     try ret.op_with_not.appendSlice(allocator, expr.op_with_not.items);
     try ret.values.appendSlice(allocator, expr.values.items);
@@ -497,13 +498,19 @@ pub fn fromExprs(
     return ret;
 }
 
+/// returns true if anything was written
 pub fn write(
     expr: Expr,
     string_collection: *StringCollection,
     writer: anytype,
-) !void {
+) !bool {
+    if (expr.op_with_not.items.len == 0)
+        return false;
+
     try writer.writeAll("#if ");
     try expr.recursiveWrite(0, false, string_collection, writer);
+
+    return true;
 }
 
 fn getValueIdx(expr: Expr, op_idx: u32) u32 {
@@ -523,6 +530,8 @@ fn opCount(expr: Expr, op_idx: u32) u32 {
     while (budget > 0) : (count += 1) {
         if (expr.op_with_not.items[op_idx + count].op.isValue())
             budget -= 1
+        else if (expr.op_with_not.items[op_idx + count].op == .ternary)
+            budget += 2
         else
             budget += 1;
     }
@@ -560,34 +569,56 @@ fn recursiveWrite(
         try writer.writeAll("(");
 
     assert(!op.isValue());
-    const rhs_idx = op_idx + 1;
-    const lhs_idx = rhs_idx + expr.opCount(rhs_idx);
-    const operator: []const u8 = if (not and op == .equal) "!=" else switch (op) {
-        .@"and" => "&&",
-        .@"or" => "||",
-        .equal => "==",
-        .less_than => "<",
-        .less_than_equal_to => "<=",
-        .greater_than => ">",
-        .greater_than_equal_to => ">=",
-        .add => "+",
-        .subtract => "-",
-        .divide => "/",
-        .multiply => "*",
-        else => unreachable,
-    };
+    if (op == .ternary) {
 
-    const lhs_op = expr.op_with_not.items[lhs_idx].op;
-    const lhs_needs_parens = op.compare(lhs_op) == .lt;
-    try expr.recursiveWrite(lhs_idx, lhs_needs_parens, string_collection, writer);
-    try writer.print(" {s} ", .{operator});
+        //const rhs_idx = op_idx + 1;
+        //const lhs_idx = rhs_idx + expr.opCount(rhs_idx);
+        //const cond_idx = lhs_idx + expr.opCount(lhs_idx);
 
-    const rhs_op = expr.op_with_not.items[rhs_idx].op;
-    const rhs_needs_parens = switch (op.compare(rhs_op)) {
-        .lt, .eq => true,
-        .gt => false,
-    };
-    try expr.recursiveWrite(rhs_idx, rhs_needs_parens, string_collection, writer);
+        //// TODO: not sure about this parens logic (for any of them)
+        //const cond_op = expr.op_with_not.items[cond_idx].op;
+        //const cond_needs_parens = op.compare(cond_op) == .lt;
+        //try expr.recursiveWrite(cond_idx, cond_needs_parens, string_collection, writer);
+        //try writer.writeAll(" ? ");
+
+        //const lhs_op = expr.op_with_not.items[lhs_idx].op;
+        //const lhs_needs_parens = op.compare(lhs_op) == .lt;
+        //try expr.recursiveWrite(lhs_idx, lhs_needs_parens, string_collection, writer);
+        //try writer.writeAll(" : ");
+
+        //const rhs_op = expr.op_with_not.items[rhs_idx].op;
+        //const rhs_needs_parens = op.compare(rhs_op) == .lt;
+        //try expr.recursiveWrite(rhs_idx, rhs_needs_parens, string_collection, writer);
+    } else {
+        const rhs_idx = op_idx + 1;
+        const lhs_idx = rhs_idx + expr.opCount(rhs_idx);
+        const operator: []const u8 = if (not and op == .equal) "!=" else switch (op) {
+            .@"and" => "&&",
+            .@"or" => "||",
+            .equal => "==",
+            .less_than => "<",
+            .less_than_equal_to => "<=",
+            .greater_than => ">",
+            .greater_than_equal_to => ">=",
+            .add => "+",
+            .subtract => "-",
+            .divide => "/",
+            .multiply => "*",
+            else => unreachable,
+        };
+
+        const lhs_op = expr.op_with_not.items[lhs_idx].op;
+        const lhs_needs_parens = op.compare(lhs_op) == .lt;
+        try expr.recursiveWrite(lhs_idx, lhs_needs_parens, string_collection, writer);
+        try writer.print(" {s} ", .{operator});
+
+        const rhs_op = expr.op_with_not.items[rhs_idx].op;
+        const rhs_needs_parens = switch (op.compare(rhs_op)) {
+            .lt, .eq => true,
+            .gt => false,
+        };
+        try expr.recursiveWrite(rhs_idx, rhs_needs_parens, string_collection, writer);
+    }
 
     if (parens or not and op != .equal)
         try writer.writeAll(")");

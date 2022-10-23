@@ -1,14 +1,19 @@
 const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+
 const arocc = @import("arocc");
+const Tokenizer = arocc.Tokenizer;
+const Token = Tokenizer.Token;
+
 const StringCollection = @import("StringCollection.zig");
 const Expr = @import("Expr.zig");
-const Tokenizer = arocc.Tokenizer;
-const assert = std.debug.assert;
+const Header = @import("Header.zig");
 
 const Merger = @This();
 
-// defines which are set when this target is chosen
-pub const Define = struct {
+/// defines which are set when this target is chosen
+pub const InputDefine = struct {
     key: []const u8,
     value: ?[]const u8 = null,
 };
@@ -16,25 +21,11 @@ pub const Define = struct {
 pub const Input = struct {
     base_dir: []const u8,
     name: []const u8,
-    defines: []const Define,
-};
-
-const Header = struct {
-    includes: std.AutoArrayHashMapUnmanaged(StringCollection.Id, void) = .{},
-    conditionals: std.ArrayListUnmanaged(PreprocessorBlock) = .{},
-    exprs: std.ArrayListUnmanaged(Expr) = .{},
-
-    fn deinit(self: *Header, allocator: std.mem.Allocator) void {
-        for (self.exprs.items) |*expr|
-            expr.deinit(allocator);
-
-        self.exprs.deinit(allocator);
-        self.includes.deinit(allocator);
-        self.conditionals.deinit(allocator);
-    }
+    defines: []const InputDefine,
 };
 
 const InputMap = std.StringHashMap(struct {
+    num: usize,
     base_dir: []const u8,
     headers: std.StringArrayHashMapUnmanaged(Header),
 });
@@ -78,12 +69,10 @@ const Conditional = struct {
 
 const InProgressPreprocessorBlock = struct {
     start: TokenRange,
-    dependents: std.ArrayListUnmanaged(PreprocessorBlockIndex) = .{},
     elifs: std.ArrayListUnmanaged(TokenRange) = .{},
     @"else": ?TokenRange = null,
 
-    fn deinit(self: *InProgressPreprocessorBlock, allocator: std.mem.Allocator) void {
-        self.dependents.deinit(allocator);
+    fn deinit(self: *InProgressPreprocessorBlock, allocator: Allocator) void {
         self.elifs.deinit(allocator);
     }
 };
@@ -97,14 +86,14 @@ const HeaderMap = std.StringHashMap(struct {
     tokens: []Tokenizer.Token,
 });
 
-allocator: std.mem.Allocator,
+allocator: Allocator,
 arena: std.heap.ArenaAllocator,
 progress: std.Progress,
 inputs: InputMap,
 string_collection: StringCollection,
 headers: HeaderMap,
 
-pub fn init(allocator: std.mem.Allocator) !Merger {
+pub fn init(allocator: Allocator) !Merger {
     return Merger{
         .allocator = allocator,
         .arena = std.heap.ArenaAllocator.init(allocator),
@@ -146,6 +135,7 @@ pub fn addInput(self: *Merger, input: Input) !void {
         };
 
     try self.inputs.putNoClobber(input.name, .{
+        .num = self.inputs.count(),
         .base_dir = input.base_dir,
         .headers = headers,
     });
@@ -181,10 +171,7 @@ pub fn getByteSize(self: Merger) usize {
     while (input_it.next()) |input_entry| {
         var header_it = input_entry.value_ptr.headers.iterator();
         while (header_it.next()) |header_entry| {
-            ret += header_entry.value_ptr.includes.count() * @sizeOf(StringCollection.Id);
-            ret += header_entry.value_ptr.conditionals.items.len * @sizeOf(PreprocessorBlock);
-            for (header_entry.value_ptr.exprs.items) |expr|
-                ret += expr.getByteSize();
+            ret += header_entry.value_ptr.getByteSize();
         }
     }
 
@@ -194,32 +181,35 @@ pub fn getByteSize(self: Merger) usize {
     return ret;
 }
 
-pub fn merge(self: *Merger) !void {
-    var unique_headers = std.StringArrayHashMap(void).init(self.allocator);
-    defer unique_headers.deinit();
+pub fn merge(self: *Merger) !std.StringArrayHashMap(Header) {
+    var final_headers = std.StringArrayHashMap(Header).init(self.allocator);
+    errdefer final_headers.deinit();
 
     var input_it = self.inputs.iterator();
     while (input_it.next()) |input_entry| {
         var header_it = input_entry.value_ptr.headers.iterator();
         while (header_it.next()) |header_entry|
-            try unique_headers.put(header_entry.key_ptr.*, {});
+            try final_headers.put(header_entry.key_ptr.*, .{});
     }
 
-    const node = self.progress.start("merging headers", unique_headers.count());
+    const node = self.progress.start("merging headers", final_headers.count());
     node.activate();
 
-    var it = unique_headers.iterator();
+    var it = final_headers.iterator();
     while (it.next()) |header_entry| {
+        const header_name = header_entry.key_ptr.*;
+        const final_header = header_entry.value_ptr;
+
         input_it = self.inputs.iterator();
         while (input_it.next()) |input_entry| {
-            _ = header_entry;
-            _ = input_entry;
-
-            std.time.sleep(100 * std.time.ns_per_ms);
+            if (input_entry.value_ptr.headers.get(header_name)) |header|
+                try final_header.merge(self.allocator, header, input_entry.value_ptr.num);
         }
 
         node.completeOne();
     }
+
+    return final_headers;
 }
 
 fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: *Header) !void {
@@ -242,6 +232,9 @@ fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: 
         .source = source.id,
     };
 
+    var conditionals = std.ArrayList(PreprocessorBlock).init(self.allocator);
+    defer conditionals.deinit();
+
     // contains the start line of a conditional
     var in_progress_conditionals = std.ArrayList(InProgressPreprocessorBlock).init(self.allocator);
     defer {
@@ -253,19 +246,12 @@ fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: 
     var tokens = std.ArrayList(Tokenizer.Token).init(self.allocator);
     defer tokens.deinit();
 
-    // the "leaf" is the key
-    var dependencies = std.AutoArrayHashMap(PreprocessorBlockIndex, PreprocessorBlockIndex).init(self.allocator);
-    defer dependencies.deinit();
-
     // TODO: make index for mapping block_idx to a range of Elifs. This is fine for now though
     var elifs = std.ArrayList(ElifPair).init(self.allocator);
     defer elifs.deinit();
 
     var elses = std.AutoHashMap(PreprocessorBlockIndex, TokenRange).init(self.allocator);
     defer elses.deinit();
-
-    var defines = StringCollection.init(self.allocator);
-    defer defines.deinit();
 
     while (true) {
         const tok = tokenizer.next();
@@ -335,19 +321,14 @@ fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: 
                         var in_progress = in_progress_conditionals.pop();
                         defer in_progress.deinit(self.allocator);
 
-                        const block_idx = @intCast(PreprocessorBlockIndex, header.conditionals.items.len);
-                        try header.conditionals.append(self.allocator, .{
+                        const block_idx = @intCast(PreprocessorBlockIndex, conditionals.items.len);
+                        try conditionals.append(.{
                             .start = in_progress.start,
                             .finish = .{
                                 .begin = tok_idx,
                                 .end = i,
                             },
                         });
-
-                        // we've processed all the dependents by now, so we can
-                        // throw them onto the table
-                        for (in_progress.dependents.items) |dependent|
-                            try dependencies.put(dependent, block_idx);
 
                         for (in_progress.elifs.items) |elif|
                             try elifs.append(.{
@@ -357,12 +338,6 @@ fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: 
 
                         if (in_progress.@"else") |@"else"|
                             try elses.putNoClobber(block_idx, @"else");
-
-                        // finally, now that our conditional has been
-                        // instantiated, it can be added as a dependent to the
-                        // top of the in_progress stack
-                        if (in_progress_conditionals.items.len > 0)
-                            try in_progress_conditionals.items[in_progress_conditionals.items.len - 1].dependents.append(self.allocator, block_idx);
                     },
                     .keyword_include => {
                         i += 1;
@@ -372,10 +347,77 @@ fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: 
                         const first_idx = i;
                         i = try consumeTokensUntil(i, tokens.items, .nl);
                         const include_str = tokenizer.buf[tokens.items[first_idx].start..tokens.items[i].end];
-                        try header.includes.put(self.allocator, try self.string_collection.getId(include_str), {});
-                        std.log.info("found header in {s}/{s}: {s}", .{ input_name, path, include_str });
+                        var expr = try getCurrentExpr(
+                            self.allocator,
+                            tokens.items,
+                            in_progress_conditionals.items,
+                            tokenizer.buf,
+                            &self.string_collection,
+                        );
+                        errdefer expr.deinit(self.allocator);
+
+                        try header.addEntity(self.allocator, expr, .{ .include = try self.string_collection.getId(include_str) });
+                        std.log.debug("found header in {s}/{s}: {s}", .{ input_name, path, include_str });
                     },
-                    .keyword_define,
+                    .keyword_define => {
+                        i += 1;
+                        const start_idx = i;
+                        while (i < tokens.items.len and tokens.items[i].id != .nl) : (i += 1) {}
+                        const end_idx = i;
+
+                        assert(tokens.items[end_idx].id == .nl);
+
+                        std.log.debug("parsing define: {s}", .{tokenizer.buf[tokens.items[start_idx].start..tokens.items[end_idx - 1].end]});
+                        var cursor = start_idx;
+
+                        // skip whitespace
+                        while (cursor < end_idx and tokens.items[cursor].id == .whitespace) : (cursor += 1) {}
+
+                        const define_key = tokenizer.buf[tokens.items[cursor].start..tokens.items[cursor].end];
+                        cursor += 1;
+
+                        if (tokens.items[cursor].id == .l_paren) {
+                            // TODO: macros
+
+                        } else {
+                            std.log.debug("define key: '{s}'", .{define_key});
+
+                            const value_tokens = trimTokens(tokens.items[cursor..end_idx]);
+
+                            // this to the end is now the value
+                            const value_str: ?[]const u8 = if (value_tokens.len > 0)
+                                tokenizer.buf[value_tokens[0].start..value_tokens[value_tokens.len - 1].end]
+                            else
+                                null;
+
+                            if (value_str) |value| {
+                                std.log.debug("define: key='{s}' value='{s}'", .{ define_key, value });
+                            } else {
+                                std.log.debug("define: key='{s}'", .{define_key});
+                            }
+
+                            var expr = try getCurrentExpr(
+                                self.allocator,
+                                tokens.items,
+                                in_progress_conditionals.items,
+                                tokenizer.buf,
+                                &self.string_collection,
+                            );
+                            errdefer expr.deinit(self.allocator);
+
+                            try header.addEntity(self.allocator, expr, .{
+                                .define = .{
+                                    .key = try self.string_collection.getId(define_key),
+                                    .value = if (value_str) |value|
+                                        try self.string_collection.getId(value)
+                                    else
+                                        null,
+                                },
+                            });
+                        }
+
+                        while (i < tokens.items.len and tokens.items[i].id != .nl) : (i += 1) {}
+                    },
                     .keyword_undef,
                     .keyword_warning,
                     .keyword_error,
@@ -399,7 +441,7 @@ fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: 
     }
 
     //const stdout = std.io.getStdOut().writer();
-    if (header.conditionals.items.len > 0) {
+    if (conditionals.items.len > 0) {
         // TODO: if there's an include guard, it'll be the last conditional, check
         // if it covers almost all of the file (at least the useful bits). If it's
         // not there, assert that there's a #pragma once. Otherwise the file might
@@ -410,21 +452,15 @@ fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: 
         // checked for
 
         // definitely an include guard: begins at first token, ends at last token
-        const block_idx = @intCast(PreprocessorBlockIndex, header.conditionals.items.len - 1);
-        const maybe_include_guard = &header.conditionals.items[block_idx];
+        const block_idx = @intCast(PreprocessorBlockIndex, conditionals.items.len - 1);
+        const maybe_include_guard = &conditionals.items[block_idx];
         if (tokensAreOneOf(tokens.items[0..maybe_include_guard.start.begin], &.{.nl}) and
             tokensAreOneOf(tokens.items[maybe_include_guard.finish.end + 1 ..], &.{ .nl, .eof }) and
             tokens.items[maybe_include_guard.start.begin + 1].id == .keyword_ifndef and
             // include guards shouldn't have an else
             !elses.contains(block_idx))
         {
-            _ = header.conditionals.pop();
-
-            var it = dependencies.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.* == block_idx)
-                    _ = dependencies.swapRemove(entry.key_ptr.*);
-            }
+            _ = conditionals.pop();
 
             assert(for (elifs.items) |pair| {
                 if (pair.block_idx == block_idx)
@@ -447,129 +483,69 @@ fn indexHeader(self: *Merger, input_name: []const u8, path: []const u8, header: 
     // run into a conditional with that many branches
 
     // only do parsing here, no analysis
-    for (header.conditionals.items) |cond, idx| {
+    for (conditionals.items) |cond, idx| {
+        _ = cond;
         const block_idx = @intCast(PreprocessorBlockIndex, idx);
-        var expr = try Expr.fromTokens(
-            self.allocator,
-            tokens.items[cond.start.begin..cond.start.end],
-            tokenizer.buf,
-            &self.string_collection,
-        );
-        defer expr.deinit(self.allocator);
+        //try header.exprs.append(
+        //    self.allocator,
+        //    try Expr.fromTokens(
+        //        self.allocator,
+        //        tokens.items[cond.start.begin..cond.start.end],
+        //        tokenizer.buf,
+        //        &self.string_collection,
+        //    ),
+        //);
 
         for (elifs.items) |pair| {
             if (pair.block_idx == block_idx) {
-                var elif_expr = try Expr.fromTokens(
-                    self.allocator,
-                    tokens.items[pair.elif.begin..pair.elif.end],
-                    tokenizer.buf,
-                    &self.string_collection,
-                );
-                defer elif_expr.deinit(self.allocator);
+                //try header.exprs.append(
+                //    self.allocator,
+                //    try Expr.fromTokens(
+                //        self.allocator,
+                //        tokens.items[pair.elif.begin..pair.elif.end],
+                //        tokenizer.buf,
+                //        &self.string_collection,
+                //    ),
+                //);
             }
         }
     }
 }
 
-pub fn saveTo(self: *Merger, out_path: []const u8) !void {
-    _ = out_path;
-    _ = self;
+/// remove preceding and trailing whitespace as well as comments, assume all on one line
+fn trimTokens(tokens: []Tokenizer.Token) []Tokenizer.Token {
+    if (tokens.len == 0)
+        return tokens;
+
+    // assume all on one line
+    for (tokens) |token|
+        assert(token.id != .nl);
+
+    // find first occurence of a non-whitespace character
+    var i: usize = 0;
+    while (i < tokens.len and tokens[i].id == .whitespace) : (i += 1) {}
+    const begin = i;
+
+    i = tokens.len - 1;
+    while (i > begin - 1 and tokens[i].id == .whitespace) : (i -= 1) {}
+
+    return tokens[begin .. i + 1];
 }
 
-fn addTokenDefine(
-    tokenizer: Tokenizer,
-    defines: *StringCollection,
-    define_interest: *std.AutoHashMap(PreprocessorBlockIndex, std.AutoArrayHashMapUnmanaged(DefineId, void)),
-    block_idx: PreprocessorBlockIndex,
-    tokens: []Tokenizer.Token,
-    i: u32,
-) !void {
-    const define_str = tokenizer.buf[tokens[i].start..tokens[i].end];
-    const define_id = try defines.getId(define_str);
-    const allocator = define_interest.allocator;
-    if (define_interest.getEntry(block_idx)) |entry| {
-        try entry.value_ptr.put(allocator, define_id, {});
-    } else {
-        var define_ids = std.AutoArrayHashMapUnmanaged(DefineId, void){};
-        errdefer define_ids.deinit(allocator);
+fn getCurrentExpr(
+    allocator: Allocator,
+    tokens: []const Token,
+    in_progress_conditionals: []const InProgressPreprocessorBlock,
+    buf: []const u8,
+    string_collection: *StringCollection,
+) !Expr {
+    if (in_progress_conditionals.len == 0)
+        return .{};
 
-        try define_ids.put(allocator, define_id, {});
-        try define_interest.put(block_idx, define_ids);
-    }
-}
+    // let's cheese it for now and only go one deep.
+    const cond = &in_progress_conditionals[in_progress_conditionals.len - 1];
 
-// TODO: find if defines are defined in the current file or in an included file
-fn findDefinesInConditional(
-    tokenizer: Tokenizer,
-    defines: *StringCollection,
-    define_interest: *std.AutoHashMap(PreprocessorBlockIndex, std.AutoArrayHashMapUnmanaged(DefineId, void)),
-    block_idx: PreprocessorBlockIndex,
-    tokens: []Tokenizer.Token,
-) !void {
-    // first token should always be a hash
-    assert(tokens[0].id == .hash);
-    var i: u32 = 1;
-    while (i < tokens.len) : (i += 1) {
-        const token = tokens[i];
-        switch (token.id) {
-            .ampersand_ampersand,
-            .angle_bracket_left,
-            .angle_bracket_left_equal,
-            .angle_bracket_right_equal,
-            .angle_bracket_right,
-            .bang,
-            .char_literal,
-            .equal_equal,
-            .keyword_elif,
-            .keyword_if,
-            .pipe_pipe,
-            .pp_num,
-            .whitespace,
-            .l_paren,
-            .r_paren,
-            .plus,
-            .char_literal_wide,
-            .minus,
-            .asterisk,
-            .bang_equal,
-            .period,
-            .slash,
-            .keyword_const2,
-            => {},
-            .keyword_ifdef,
-            .keyword_ifndef,
-            => {
-                // consume whitespace
-                i += 1;
-                while (i < tokens.len and tokens[i].id == .whitespace) : (i += 1) {}
-
-                assert(tokens[i].id == .identifier);
-                try addTokenDefine(tokenizer, defines, define_interest, block_idx, tokens, i);
-            },
-            // first sighting of this was in a comparison
-            .identifier => try addTokenDefine(tokenizer, defines, define_interest, block_idx, tokens, i),
-            // some uses of this don't have brackets
-            .keyword_defined => {
-                i += 1;
-                while (i < tokens.len and tokens[i].id == .whitespace) : (i += 1) {}
-                if (tokens[i].id == .l_paren)
-                    i += 1;
-
-                while (i < tokens.len and tokens[i].id == .whitespace) : (i += 1) {}
-
-                assert(tokens[i].id == .identifier);
-                try addTokenDefine(tokenizer, defines, define_interest, block_idx, tokens, i);
-
-                if (tokens[i].id == .r_paren)
-                    i += 1;
-            },
-            else => {
-                std.log.err("unexpected token: {}", .{token});
-                std.log.err("text: {s}", .{tokenizer.buf[token.start..token.end]});
-                return error.Unexpected;
-            },
-        }
-    }
+    return Expr.fromTokens(allocator, tokens[cond.start.begin..cond.start.end], buf, string_collection);
 }
 
 fn tokensAreOneOf(tokens: []Tokenizer.Token, ids: []const Tokenizer.Token.Id) bool {
